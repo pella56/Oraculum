@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  bookingPayloadKey,
+  createBookingSubmissionDeduper,
   createSubmissionGate,
   getBookingSubmissionError,
   mapBookingSubmissionError,
@@ -47,79 +49,6 @@ describe("createSubmissionGate", () => {
     });
   });
 
-  describe("booking submission server errors", () => {
-    it("maps Nest validation messages to stable fields", () => {
-      const error = {
-        status: 400,
-        data: {
-          message: [
-            "workspaceId must be a UUID",
-            "endDate must be after startDate",
-            "seatCount must be at least 1",
-          ],
-        },
-      };
-
-      expect(mapBookingSubmissionError(error)).toEqual({
-        workspaceId: "workspaceId must be a UUID",
-        endDate: "endDate must be after startDate",
-        seatCount: "seatCount must be at least 1",
-      });
-    });
-
-    it("maps structured field errors without changing server text", () => {
-      const error = {
-        status: 422,
-        data: {
-          errors: {
-            startDate: "The start date cannot be in the past.",
-            seatCount: "Choose at least one seat.",
-          },
-        },
-      };
-
-      expect(mapBookingSubmissionErrors(error)).toEqual({
-        startDate: "The start date cannot be in the past.",
-        seatCount: "Choose at least one seat.",
-      });
-    });
-
-    it("maps an availability conflict to seatCount", () => {
-      const error = {
-        status: 409,
-        code: "SEATS_UNAVAILABLE",
-        serverMessage: "Only 2 seat(s) available for the requested dates",
-        message: "Only 2 seat(s) available for the requested dates",
-      };
-
-      expect(mapServerBookingError(error)).toEqual({
-        seatCount: "Only 2 seat(s) available for the requested dates",
-      });
-    });
-
-    it("preserves a generic server message as the form fallback", () => {
-      const error = {
-        status: 500,
-        serverMessage: "The booking service is unavailable.",
-        message: "The booking service is unavailable.",
-      };
-
-      expect(getBookingSubmissionError(error)).toEqual({
-        fieldErrors: {},
-        formError: "The booking service is unavailable.",
-      });
-    });
-
-    it("returns no field error for a message that has no known booking field", () => {
-      expect(
-        mapBookingSubmissionError({
-          status: 422,
-          serverMessage: "The submitted data is invalid.",
-        })
-      ).toEqual({});
-    });
-  });
-
   it("collapses a burst of clicks into one request", async () => {
     const gate = createSubmissionGate();
     const first = deferred<string>();
@@ -158,5 +87,150 @@ describe("createSubmissionGate", () => {
       status: "completed",
       value: "ok",
     });
+  });
+});
+
+describe("bookingPayloadKey", () => {
+  it("is independent of property order", () => {
+    expect(
+      bookingPayloadKey({ workspaceId: "w1", seatCount: 2, dates: { start: "a", end: "b" } })
+    ).toBe(
+      bookingPayloadKey({ dates: { end: "b", start: "a" }, seatCount: 2, workspaceId: "w1" })
+    );
+  });
+
+  it("differs when payload values differ", () => {
+    expect(bookingPayloadKey({ seatCount: 2 })).not.toBe(
+      bookingPayloadKey({ seatCount: 3 })
+    );
+  });
+});
+
+describe("createBookingSubmissionDeduper", () => {
+  const payload = { workspaceId: "w1", planType: "daily", seatCount: 2 };
+
+  it("ignores a concurrent submission with an identical payload", async () => {
+    const deduper = createBookingSubmissionDeduper();
+    const first = deferred<string>();
+    const task = vi.fn().mockReturnValue(first.promise);
+
+    const inFlight = deduper.submit(payload, task);
+    const duplicate = deduper.submit({ ...payload }, task);
+
+    expect(deduper.isInFlight(payload)).toBe(true);
+    await expect(duplicate).resolves.toEqual({ status: "ignored" });
+    expect(task).toHaveBeenCalledTimes(1);
+
+    first.resolve("booking-1");
+    await expect(inFlight).resolves.toEqual({
+      status: "completed",
+      value: "booking-1",
+    });
+  });
+
+  it("lets a different payload proceed concurrently", async () => {
+    const deduper = createBookingSubmissionDeduper();
+    const a = deferred<string>();
+    const b = deferred<string>();
+    const taskA = vi.fn().mockReturnValue(a.promise);
+    const taskB = vi.fn().mockReturnValue(b.promise);
+
+    const pa = deduper.submit(payload, taskA);
+    const pb = deduper.submit({ ...payload, seatCount: 5 }, taskB);
+
+    expect(taskA).toHaveBeenCalledTimes(1);
+    expect(taskB).toHaveBeenCalledTimes(1);
+
+    a.resolve("A");
+    b.resolve("B");
+    await expect(pa).resolves.toEqual({ status: "completed", value: "A" });
+    await expect(pb).resolves.toEqual({ status: "completed", value: "B" });
+  });
+
+  it("releases the payload after failure so a retry is accepted", async () => {
+    const deduper = createBookingSubmissionDeduper();
+    const task = vi.fn().mockRejectedValue(new Error("Booking rejected"));
+
+    await expect(deduper.submit(payload, task)).rejects.toThrow("Booking rejected");
+    expect(deduper.isInFlight(payload)).toBe(false);
+
+    task.mockResolvedValue("ok");
+    await expect(deduper.submit(payload, task)).resolves.toEqual({
+      status: "completed",
+      value: "ok",
+    });
+  });
+});
+
+describe("booking submission server errors", () => {
+  it("maps Nest validation messages to stable fields", () => {
+    const error = {
+      status: 400,
+      data: {
+        message: [
+          "workspaceId must be a UUID",
+          "endDate must be after startDate",
+          "seatCount must be at least 1",
+        ],
+      },
+    };
+
+    expect(mapBookingSubmissionError(error)).toEqual({
+      workspaceId: "workspaceId must be a UUID",
+      endDate: "endDate must be after startDate",
+      seatCount: "seatCount must be at least 1",
+    });
+  });
+
+  it("maps structured field errors without changing server text", () => {
+    const error = {
+      status: 422,
+      data: {
+        errors: {
+          startDate: "The start date cannot be in the past.",
+          seatCount: "Choose at least one seat.",
+        },
+      },
+    };
+
+    expect(mapBookingSubmissionErrors(error)).toEqual({
+      startDate: "The start date cannot be in the past.",
+      seatCount: "Choose at least one seat.",
+    });
+  });
+
+  it("maps an availability conflict to seatCount", () => {
+    const error = {
+      status: 409,
+      code: "SEATS_UNAVAILABLE",
+      serverMessage: "Only 2 seat(s) available for the requested dates",
+      message: "Only 2 seat(s) available for the requested dates",
+    };
+
+    expect(mapServerBookingError(error)).toEqual({
+      seatCount: "Only 2 seat(s) available for the requested dates",
+    });
+  });
+
+  it("preserves a generic server message as the form fallback", () => {
+    const error = {
+      status: 500,
+      serverMessage: "The booking service is unavailable.",
+      message: "The booking service is unavailable.",
+    };
+
+    expect(getBookingSubmissionError(error)).toEqual({
+      fieldErrors: {},
+      formError: "The booking service is unavailable.",
+    });
+  });
+
+  it("returns no field error for a message that has no known booking field", () => {
+    expect(
+      mapBookingSubmissionError({
+        status: 422,
+        serverMessage: "The submitted data is invalid.",
+      })
+    ).toEqual({});
   });
 });

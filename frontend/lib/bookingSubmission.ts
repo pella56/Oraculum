@@ -35,6 +35,61 @@ export function createSubmissionGate(): SubmissionGate {
   };
 }
 
+/**
+ * Produces a deterministic key for a booking payload so that concurrent
+ * submissions of the same booking can be recognised as duplicates. Object keys
+ * are sorted so property order does not affect the fingerprint.
+ */
+export function bookingPayloadKey(payload: unknown): string {
+  return JSON.stringify(sortKeysDeep(payload));
+}
+
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeysDeep);
+  if (value !== null && typeof value === "object") {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      sorted[key] = sortKeysDeep((value as Record<string, unknown>)[key]);
+    }
+    return sorted;
+  }
+  return value;
+}
+
+export interface BookingSubmissionDeduper {
+  isInFlight(payload: unknown): boolean;
+  submit<T>(payload: unknown, task: () => Promise<T>): Promise<SubmissionOutcome<T>>;
+}
+
+/**
+ * Tracks in-flight booking submissions by payload fingerprint. A submission
+ * whose payload matches one already in flight is ignored; submissions with a
+ * different payload proceed independently. The key is released when the task
+ * settles, success or failure.
+ */
+export function createBookingSubmissionDeduper(): BookingSubmissionDeduper {
+  const inFlight = new Set<string>();
+
+  return {
+    isInFlight: (payload) => inFlight.has(bookingPayloadKey(payload)),
+
+    async submit<T>(
+      payload: unknown,
+      task: () => Promise<T>
+    ): Promise<SubmissionOutcome<T>> {
+      const key = bookingPayloadKey(payload);
+      if (inFlight.has(key)) return { status: "ignored" };
+
+      inFlight.add(key);
+      try {
+        return { status: "completed", value: await task() };
+      } finally {
+        inFlight.delete(key);
+      }
+    },
+  };
+}
+
 export type BookingSubmissionFieldName =
   | "workspaceId"
   | "planType"
